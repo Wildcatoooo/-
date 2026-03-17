@@ -7,6 +7,8 @@ import fs from "fs";
 
 const DATA_DIR = path.join(process.cwd(), "data");
 const CLASSES_FILE = path.join(DATA_DIR, "classes.json");
+const EXAMS_FILE = path.join(DATA_DIR, "exams.json");
+const RESULTS_FILE = path.join(DATA_DIR, "results.json");
 
 // Ensure data directory exists
 if (!fs.existsSync(DATA_DIR)) {
@@ -27,6 +29,14 @@ function saveClasses() {
   fs.writeFileSync(CLASSES_FILE, JSON.stringify(classes, null, 2));
 }
 
+function saveExams(exams: any[]) {
+  fs.writeFileSync(EXAMS_FILE, JSON.stringify(exams, null, 2));
+}
+
+function saveResults(results: any[]) {
+  fs.writeFileSync(RESULTS_FILE, JSON.stringify(results, null, 2));
+}
+
 async function startServer() {
   const app = express();
   const httpServer = createServer(app);
@@ -45,6 +55,18 @@ async function startServer() {
   let examResults: any[] = [];
   let distributedFiles: any[] = [];
 
+  // Load persisted data
+  if (fs.existsSync(EXAMS_FILE)) {
+    try {
+      exams = JSON.parse(fs.readFileSync(EXAMS_FILE, "utf-8"));
+    } catch (e) { console.error("Error loading exams:", e); }
+  }
+  if (fs.existsSync(RESULTS_FILE)) {
+    try {
+      examResults = JSON.parse(fs.readFileSync(RESULTS_FILE, "utf-8"));
+    } catch (e) { console.error("Error loading results:", e); }
+  }
+
   // Socket.io logic
   io.on("connection", (socket) => {
     console.log("A user connected:", socket.id);
@@ -53,6 +75,7 @@ async function startServer() {
     socket.emit("admin:classes", classes);
     socket.emit("admin:exams", exams);
     socket.emit("admin:exam_results", examResults);
+    socket.emit("admin:submissions", submissions);
     socket.emit("admin:distributed_files", distributedFiles);
 
     socket.on("admin:save_classes", (newClasses) => {
@@ -95,6 +118,12 @@ async function startServer() {
         (f.target === "student" && f.targetId === data.name)
       );
       socket.emit("student:received_files", studentFiles);
+
+      // Send active exam if any
+      const activeExam = exams.find(e => e.active);
+      if (activeExam) {
+        socket.emit("student:exam_started", activeExam);
+      }
     });
 
     socket.on("student:logout", () => {
@@ -107,10 +136,23 @@ async function startServer() {
     });
 
     socket.on("admin:start_exam", (examData) => {
-      const newExam = { ...examData, id: Date.now().toString(), active: true };
+      const newExam = { 
+        ...examData, 
+        id: Date.now().toString(), 
+        active: true,
+        startTime: Date.now()
+      };
       exams.push(newExam);
+      saveExams(exams);
       io.emit("student:exam_started", newExam);
       io.emit("admin:exams", exams);
+    });
+
+    socket.on("admin:stop_exam", (id) => {
+      exams = exams.map(e => e.id === id ? { ...e, active: false } : e);
+      saveExams(exams);
+      io.emit("admin:exams", exams);
+      io.emit("student:exam_stopped", id);
     });
 
     socket.on("student:submit_homework", (submission) => {
@@ -132,7 +174,13 @@ async function startServer() {
         timestamp: new Date()
       };
       examResults.push(newResult);
+      saveResults(examResults);
       io.emit("admin:exam_results", examResults);
+    });
+
+    socket.on("student:progress_update", (progress) => {
+      activeStudents = activeStudents.map(s => s.id === socket.id ? { ...s, examProgress: progress } : s);
+      io.emit("admin:students", activeStudents);
     });
 
     socket.on("admin:distribute_file", (fileData) => {
