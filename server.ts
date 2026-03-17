@@ -43,6 +43,7 @@ async function startServer() {
   let exams: any[] = [];
   let submissions: any[] = [];
   let examResults: any[] = [];
+  let distributedFiles: any[] = [];
 
   // Socket.io logic
   io.on("connection", (socket) => {
@@ -52,6 +53,7 @@ async function startServer() {
     socket.emit("admin:classes", classes);
     socket.emit("admin:exams", exams);
     socket.emit("admin:exam_results", examResults);
+    socket.emit("admin:distributed_files", distributedFiles);
 
     socket.on("admin:save_classes", (newClasses) => {
       classes = newClasses;
@@ -61,9 +63,9 @@ async function startServer() {
 
     socket.on("student:login", (data) => {
       // Check if student exists in any class
-      const studentExists = classes.some(c => c.students.includes(data.name));
+      const studentClass = classes.find(c => c.students.includes(data.name));
       
-      if (!studentExists) {
+      if (!studentClass) {
         socket.emit("student:error", "未找到该学生：姓名不在名单中，请联系老师。");
         return;
       }
@@ -77,6 +79,7 @@ async function startServer() {
       const student = {
         id: socket.id,
         name: data.name,
+        className: studentClass.name,
         status: "online",
         lastSeen: new Date(),
       };
@@ -84,6 +87,14 @@ async function startServer() {
       activeStudents.push(student);
       io.emit("admin:students", activeStudents);
       socket.emit("student:confirmed", student);
+      
+      // Send relevant distributed files to student
+      const studentFiles = distributedFiles.filter(f => 
+        f.target === "all" || 
+        (f.target === "class" && f.targetId === studentClass.name) ||
+        (f.target === "student" && f.targetId === data.name)
+      );
+      socket.emit("student:received_files", studentFiles);
     });
 
     socket.on("student:logout", () => {
@@ -103,9 +114,11 @@ async function startServer() {
     });
 
     socket.on("student:submit_homework", (submission) => {
+      const student = activeStudents.find(s => s.id === socket.id);
       const newSubmission = { 
         ...submission, 
         id: Date.now().toString(), 
+        className: student?.className || "未知班级",
         timestamp: new Date() 
       };
       submissions.push(newSubmission);
@@ -120,6 +133,39 @@ async function startServer() {
       };
       examResults.push(newResult);
       io.emit("admin:exam_results", examResults);
+    });
+
+    socket.on("admin:distribute_file", (fileData) => {
+      const newFile = {
+        ...fileData,
+        id: Date.now().toString(),
+        timestamp: new Date()
+      };
+      distributedFiles.push(newFile);
+      io.emit("admin:distributed_files", distributedFiles);
+      
+      // Notify relevant students
+      if (fileData.target === "all") {
+        io.emit("student:received_files", distributedFiles.filter(f => f.target === "all" || f.target === "class" || f.target === "student")); // Simplified: just send all relevant to everyone or filter properly
+        // Better: broadcast to everyone, they will filter or we send specifically
+        io.emit("student:new_file", newFile);
+      } else if (fileData.target === "class") {
+        activeStudents.forEach(s => {
+          if (s.className === fileData.targetId) {
+            io.to(s.id).emit("student:new_file", newFile);
+          }
+        });
+      } else if (fileData.target === "student") {
+        const targetStudent = activeStudents.find(s => s.name === fileData.targetId);
+        if (targetStudent) {
+          io.to(targetStudent.id).emit("student:new_file", newFile);
+        }
+      }
+    });
+
+    socket.on("admin:delete_distributed_file", (id) => {
+      distributedFiles = distributedFiles.filter(f => f.id !== id);
+      io.emit("admin:distributed_files", distributedFiles);
     });
 
     socket.on("disconnect", () => {

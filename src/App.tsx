@@ -16,10 +16,16 @@ import {
   Plus,
   ClipboardList,
   FileText,
-  FileUp
+  FileUp,
+  Paperclip,
+  Image as ImageIcon,
+  File as FileIcon,
+  Trash2,
+  Download
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import mammoth from 'mammoth';
+import JSZip from 'jszip';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 
@@ -51,10 +57,30 @@ interface Exam {
   active: boolean;
 }
 
+interface SubmissionFile {
+  name: string;
+  type: string;
+  data: string; // base64
+  size: number;
+}
+
 interface Submission {
   id: string;
   studentName: string;
+  className?: string;
   content: string;
+  files?: SubmissionFile[];
+  timestamp: Date;
+}
+
+interface DistributedFile {
+  id: string;
+  name: string;
+  type: string;
+  data: string;
+  size: number;
+  target: 'all' | 'class' | 'student';
+  targetId?: string;
   timestamp: Date;
 }
 
@@ -85,9 +111,13 @@ export default function App() {
   const [exams, setExams] = useState<Exam[]>([]);
   const [submissions, setSubmissions] = useState<Submission[]>([]);
   const [examResults, setExamResults] = useState<ExamResult[]>([]);
-  const [serverUrl, setServerUrl] = useState(window.location.origin);
+  const [distributedFiles, setDistributedFiles] = useState<DistributedFile[]>([]);
+  const [receivedFiles, setReceivedFiles] = useState<DistributedFile[]>([]);
+  const [serverUrl, setServerUrl] = useState('');
+  const [activeUrl, setActiveUrl] = useState(window.location.origin);
   const [isConnecting, setIsConnecting] = useState(false);
   const socketRef = useRef<Socket | null>(null);
+  const [pendingLogin, setPendingLogin] = useState(false);
 
   // Modal State
   const [isClassModalOpen, setIsClassModalOpen] = useState(false);
@@ -107,15 +137,24 @@ export default function App() {
   const [studentAnswers, setStudentAnswers] = useState<number[]>([]);
   const [examSubmitted, setExamSubmitted] = useState(false);
   const [homeworkContent, setHomeworkContent] = useState('');
+  const [homeworkFiles, setHomeworkFiles] = useState<SubmissionFile[]>([]);
+  const [isDragging, setIsDragging] = useState(false);
 
   useEffect(() => {
     const setupSocket = (url: string) => {
       const newSocket = io(url);
       socketRef.current = newSocket;
       
-      newSocket.on('connect', () => setIsConnecting(false));
+      newSocket.on('connect', () => {
+        setIsConnecting(false);
+        if (pendingLogin && studentName.trim()) {
+          newSocket.emit('student:login', { name: studentName });
+          setPendingLogin(false);
+        }
+      });
       newSocket.on('connect_error', () => {
         setIsConnecting(false);
+        setPendingLogin(false);
         setLoginError('无法连接到服务器，请检查地址是否正确。');
       });
 
@@ -124,6 +163,12 @@ export default function App() {
       newSocket.on('admin:exams', (data: Exam[]) => setExams(data));
       newSocket.on('admin:submissions', (data: Submission[]) => setSubmissions(data));
       newSocket.on('admin:exam_results', (data: ExamResult[]) => setExamResults(data));
+      newSocket.on('admin:distributed_files', (data: DistributedFile[]) => setDistributedFiles(data));
+      newSocket.on('student:received_files', (data: DistributedFile[]) => setReceivedFiles(data));
+      newSocket.on('student:new_file', (file: DistributedFile) => {
+        setReceivedFiles(prev => [...prev, file]);
+        alert(`收到新文件: ${file.name}`);
+      });
       newSocket.on('student:exam_started', (exam: Exam) => {
         setActiveExam(exam);
         setStudentAnswers(new Array(exam.questions.length).fill(-1));
@@ -138,17 +183,43 @@ export default function App() {
       return newSocket;
     };
 
-    const currentSocket = setupSocket(serverUrl);
+    const currentSocket = setupSocket(activeUrl);
 
     return () => {
       currentSocket.close();
     };
-  }, [serverUrl]);
+  }, [activeUrl, pendingLogin, studentName]);
 
   const handleStudentLogin = (e: React.FormEvent) => {
     e.preventDefault();
-    if (studentName.trim() && socketRef.current) {
-      socketRef.current.emit('student:login', { name: studentName });
+    
+    let inputUrl = serverUrl.trim();
+    let formattedUrl;
+
+    if (!inputUrl) {
+      formattedUrl = window.location.origin;
+    } else {
+      formattedUrl = inputUrl;
+      if (!formattedUrl.startsWith('http')) {
+        if (!formattedUrl.includes(':')) {
+          formattedUrl = `http://${formattedUrl}:3000`;
+        } else {
+          formattedUrl = `http://${formattedUrl}`;
+        }
+      }
+    }
+
+    if (formattedUrl !== activeUrl) {
+      setIsConnecting(true);
+      setPendingLogin(true);
+      setActiveUrl(formattedUrl);
+    } else if (studentName.trim() && socketRef.current) {
+      if (socketRef.current.connected) {
+        socketRef.current.emit('student:login', { name: studentName });
+      } else {
+        setIsConnecting(true);
+        setPendingLogin(true);
+      }
     }
   };
 
@@ -331,13 +402,111 @@ export default function App() {
   };
 
   const submitHomework = () => {
-    if (homeworkContent.trim() && socketRef.current) {
+    if ((homeworkContent.trim() || homeworkFiles.length > 0) && socketRef.current) {
       socketRef.current.emit('student:submit_homework', { 
         studentName, 
-        content: homeworkContent 
+        content: homeworkContent,
+        files: homeworkFiles
       });
       setHomeworkContent('');
+      setHomeworkFiles([]);
       alert('作业已提交！');
+    }
+  };
+
+  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (files) {
+      processFiles(Array.from(files));
+    }
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(false);
+    const files = e.dataTransfer.files;
+    if (files) {
+      processFiles(Array.from(files));
+    }
+  };
+
+  const processFiles = (files: File[]) => {
+    files.forEach(file => {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const base64Data = e.target?.result as string;
+        setHomeworkFiles(prev => [...prev, {
+          name: file.name,
+          type: file.type,
+          data: base64Data,
+          size: file.size
+        }]);
+      };
+      reader.readAsDataURL(file);
+    });
+  };
+
+  const removeFile = (index: number) => {
+    setHomeworkFiles(prev => prev.filter((_, i) => i !== index));
+  };
+
+  const formatFileSize = (bytes: number) => {
+    if (bytes === 0) return '0 B';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+  };
+
+  const downloadAllSubmissions = async () => {
+    if (submissions.length === 0) return;
+    
+    const zip = new JSZip();
+    
+    submissions.forEach(sub => {
+      const folderName = sub.className || '未分类';
+      const studentFolder = zip.folder(folderName);
+      
+      if (sub.content) {
+        studentFolder?.file(`${sub.studentName}_作业内容.txt`, sub.content);
+      }
+      
+      if (sub.files && sub.files.length > 0) {
+        sub.files.forEach(file => {
+          // Extract base64 data
+          const base64Data = file.data.split(',')[1];
+          studentFolder?.file(`${sub.studentName}_${file.name}`, base64Data, { base64: true });
+        });
+      }
+    });
+    
+    const content = await zip.generateAsync({ type: 'blob' });
+    const url = URL.createObjectURL(content);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `学生作业_${new Date().toLocaleDateString()}.zip`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
+
+  const distributeFile = (file: SubmissionFile, target: 'all' | 'class' | 'student', targetId?: string) => {
+    if (socketRef.current) {
+      socketRef.current.emit('admin:distribute_file', {
+        name: file.name,
+        type: file.type,
+        data: file.data,
+        size: file.size,
+        target,
+        targetId
+      });
+    }
+  };
+
+  const deleteDistributedFile = (id: string) => {
+    if (socketRef.current) {
+      socketRef.current.emit('admin:delete_distributed_file', id);
     }
   };
 
@@ -777,6 +946,15 @@ export default function App() {
                   <h1 className="text-3xl font-bold text-gray-900">作业与成绩</h1>
                   <p className="text-gray-500 mt-1">查看学生提交的作业和考试成绩</p>
                 </div>
+                <div className="flex items-center space-x-4">
+                  <button
+                    onClick={downloadAllSubmissions}
+                    className="flex items-center space-x-2 px-4 py-2 bg-indigo-600 text-white rounded-xl hover:bg-indigo-700 transition-all text-sm font-bold shadow-lg shadow-indigo-600/20"
+                  >
+                    <Download className="w-4 h-4" />
+                    <span>打包下载全部</span>
+                  </button>
+                </div>
               </header>
 
               <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
@@ -793,54 +971,161 @@ export default function App() {
                       submissions.slice().reverse().map(sub => (
                         <div key={sub.id} className="p-5 bg-gray-50 rounded-2xl border border-gray-100">
                           <div className="flex justify-between items-center mb-3">
-                            <span className="font-bold text-gray-900">{sub.studentName}</span>
+                            <div>
+                              <span className="font-bold text-gray-900">{sub.studentName}</span>
+                              <span className="ml-2 text-[10px] bg-indigo-100 text-indigo-600 px-2 py-0.5 rounded-full uppercase font-bold">
+                                {sub.className}
+                              </span>
+                            </div>
                             <span className="text-xs text-gray-400">{new Date(sub.timestamp).toLocaleString()}</span>
                           </div>
-                          <p className="text-sm text-gray-600 leading-relaxed">{sub.content}</p>
+                          {sub.content && <p className="text-sm text-gray-600 leading-relaxed mb-3">{sub.content}</p>}
+                          
+                          {sub.files && sub.files.length > 0 && (
+                            <div className="space-y-2">
+                              <p className="text-[10px] font-bold text-gray-400 uppercase tracking-wider">附件 ({sub.files.length})</p>
+                              <div className="grid grid-cols-1 gap-2">
+                                {sub.files.map((file, idx) => (
+                                  <div key={idx} className="flex items-center justify-between p-2 bg-white rounded-xl border border-gray-100 text-xs">
+                                    <div className="flex items-center space-x-2 overflow-hidden">
+                                      {file.type.startsWith('image/') ? <ImageIcon className="w-3 h-3 text-emerald-500 shrink-0" /> : <FileIcon className="w-3 h-3 text-indigo-500 shrink-0" />}
+                                      <span className="truncate text-gray-700">{file.name}</span>
+                                    </div>
+                                    <div className="flex items-center space-x-1">
+                                      <button
+                                        onClick={() => distributeFile(file, 'student', sub.studentName)}
+                                        title="返回给学生修改"
+                                        className="p-1.5 text-amber-600 hover:bg-amber-50 rounded-lg transition-colors"
+                                      >
+                                        <Send className="w-3 h-3" />
+                                      </button>
+                                      <a 
+                                        href={file.data} 
+                                        download={`${sub.studentName}_${file.name}`}
+                                        className="p-1.5 text-indigo-600 hover:bg-indigo-50 rounded-lg transition-colors"
+                                      >
+                                        <Download className="w-3 h-3" />
+                                      </a>
+                                    </div>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          )}
                         </div>
                       ))
                     )}
                   </div>
                 </div>
 
-                {/* Exam Results */}
-                <div className="bg-white rounded-3xl border border-black/5 p-8 shadow-sm">
-                  <h2 className="text-xl font-bold text-gray-900 mb-6 flex items-center space-x-2">
-                    <CheckCircle className="w-5 h-5 text-emerald-600" />
-                    <span>考试成绩 ({examResults.length})</span>
-                  </h2>
-                  <div className="space-y-4 max-h-[600px] overflow-auto pr-2">
-                    {examResults.length === 0 ? (
-                      <p className="text-gray-400 text-center py-10 italic">暂无考试成绩</p>
-                    ) : (
-                      examResults.slice().reverse().map(res => {
-                        const exam = exams.find(e => e.id === res.examId);
-                        return (
-                          <div key={res.id} className="p-5 bg-emerald-50/50 rounded-2xl border border-emerald-100">
-                            <div className="flex justify-between items-center mb-3">
-                              <div>
-                                <span className="font-bold text-gray-900 block">{res.studentName}</span>
-                                <span className="text-[10px] text-gray-500 uppercase font-bold tracking-wider">
-                                  {exam?.title || '未知考试'}
-                                </span>
+                <div className="space-y-8">
+                  {/* File Distribution */}
+                  <div className="bg-white rounded-3xl border border-black/5 p-8 shadow-sm">
+                    <h2 className="text-xl font-bold text-gray-900 mb-6 flex items-center space-x-2">
+                      <FileUp className="w-5 h-5 text-indigo-600" />
+                      <span>文件分发</span>
+                    </h2>
+                    
+                    <div className="space-y-4">
+                      <div 
+                        className="border-2 border-dashed border-gray-200 rounded-2xl p-6 flex flex-col items-center justify-center text-center hover:border-indigo-400 hover:bg-gray-50/50 transition-all cursor-pointer"
+                        onClick={() => document.getElementById('admin-file-dist')?.click()}
+                      >
+                        <input 
+                          id="admin-file-dist"
+                          type="file" 
+                          className="hidden" 
+                          onChange={(e) => {
+                            const file = e.target.files?.[0];
+                            if (file) {
+                              const reader = new FileReader();
+                              reader.onload = (ev) => {
+                                const data = ev.target?.result as string;
+                                distributeFile({
+                                  name: file.name,
+                                  type: file.type,
+                                  data: data,
+                                  size: file.size
+                                }, 'all');
+                              };
+                              reader.readAsDataURL(file);
+                            }
+                          }}
+                        />
+                        <Plus className="w-8 h-8 text-indigo-400 mb-2" />
+                        <p className="text-sm font-medium text-gray-700">分发新文件给全班</p>
+                      </div>
+
+                      <div className="space-y-2">
+                        <p className="text-[10px] font-bold text-gray-400 uppercase tracking-wider">已分发的文件 ({distributedFiles.length})</p>
+                        {distributedFiles.length === 0 ? (
+                          <p className="text-xs text-gray-400 italic">暂无分发记录</p>
+                        ) : (
+                          distributedFiles.slice().reverse().map(file => (
+                            <div key={file.id} className="flex items-center justify-between p-3 bg-gray-50 rounded-xl border border-gray-100">
+                              <div className="flex items-center space-x-3 overflow-hidden">
+                                <div className="w-8 h-8 bg-indigo-50 rounded-lg flex items-center justify-center shrink-0">
+                                  <FileIcon className="w-4 h-4 text-indigo-600" />
+                                </div>
+                                <div className="flex flex-col overflow-hidden">
+                                  <span className="text-xs font-bold text-gray-900 truncate">{file.name}</span>
+                                  <span className="text-[10px] text-gray-400">
+                                    {file.target === 'all' ? '全班' : file.targetId} • {formatFileSize(file.size)}
+                                  </span>
+                                </div>
                               </div>
-                              <div className="text-right">
-                                <span className="text-2xl font-black text-emerald-600">
-                                  {res.score}
-                                </span>
-                                <span className="text-xs text-emerald-400"> / {res.totalQuestions}</span>
+                              <button 
+                                onClick={() => deleteDistributedFile(file.id)}
+                                className="p-2 text-gray-400 hover:text-red-500 transition-colors"
+                              >
+                                <Trash2 className="w-4 h-4" />
+                              </button>
+                            </div>
+                          ))
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Exam Results */}
+                  <div className="bg-white rounded-3xl border border-black/5 p-8 shadow-sm">
+                    <h2 className="text-xl font-bold text-gray-900 mb-6 flex items-center space-x-2">
+                      <CheckCircle className="w-5 h-5 text-emerald-600" />
+                      <span>考试成绩 ({examResults.length})</span>
+                    </h2>
+                    <div className="space-y-4 max-h-[400px] overflow-auto pr-2">
+                      {examResults.length === 0 ? (
+                        <p className="text-gray-400 text-center py-10 italic">暂无考试成绩</p>
+                      ) : (
+                        examResults.slice().reverse().map(res => {
+                          const exam = exams.find(e => e.id === res.examId);
+                          return (
+                            <div key={res.id} className="p-5 bg-emerald-50/50 rounded-2xl border border-emerald-100">
+                              <div className="flex justify-between items-center mb-3">
+                                <div>
+                                  <span className="font-bold text-gray-900 block">{res.studentName}</span>
+                                  <span className="text-[10px] text-gray-500 uppercase font-bold tracking-wider">
+                                    {exam?.title || '未知考试'}
+                                  </span>
+                                </div>
+                                <div className="text-right">
+                                  <span className="text-2xl font-black text-emerald-600">
+                                    {res.score}
+                                  </span>
+                                  <span className="text-xs text-emerald-400"> / {res.totalQuestions}</span>
+                                </div>
+                              </div>
+                              <div className="w-full bg-emerald-100 h-1.5 rounded-full overflow-hidden">
+                                <div 
+                                  className="bg-emerald-500 h-full transition-all duration-1000" 
+                                  style={{ width: `${(res.score / res.totalQuestions) * 100}%` }}
+                                />
                               </div>
                             </div>
-                            <div className="w-full bg-emerald-100 h-1.5 rounded-full overflow-hidden">
-                              <div 
-                                className="bg-emerald-500 h-full transition-all duration-1000" 
-                                style={{ width: `${(res.score / res.totalQuestions) * 100}%` }}
-                              />
-                            </div>
-                          </div>
-                        );
-                      })
-                    )}
+                          );
+                        })
+                      )}
+                    </div>
                   </div>
                 </div>
               </div>
@@ -884,12 +1169,12 @@ export default function App() {
               </div>
 
               <div className="pt-4 border-t border-gray-50">
-                <label className="text-[10px] font-bold text-gray-400 uppercase ml-2">服务器地址 (局域网可用)</label>
+                <label className="text-[10px] font-bold text-gray-400 uppercase ml-2">教师机 IP 地址</label>
                 <input
                   type="text"
                   value={serverUrl}
                   onChange={(e) => setServerUrl(e.target.value)}
-                  placeholder="http://192.168.x.x:3000"
+                  placeholder="留空使用默认地址，或输入 IP (如 192.168.1.5)"
                   className="w-full px-5 py-3 bg-gray-50 border border-gray-100 rounded-xl text-xs font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
                 />
               </div>
@@ -1028,6 +1313,40 @@ export default function App() {
             </div>
 
             <div className="space-y-8">
+              {/* Received Files */}
+              {receivedFiles.length > 0 && (
+                <div className="bg-white rounded-3xl border border-black/5 p-8 shadow-sm">
+                  <div className="flex items-center space-x-3 mb-6">
+                    <div className="w-10 h-10 bg-indigo-50 rounded-xl flex items-center justify-center">
+                      <FileUp className="w-5 h-5 text-indigo-600" />
+                    </div>
+                    <h2 className="text-xl font-bold text-gray-900">收到的文件</h2>
+                  </div>
+                  <div className="space-y-3">
+                    {receivedFiles.slice().reverse().map(file => (
+                      <div key={file.id} className="flex items-center justify-between p-4 bg-gray-50 rounded-2xl border border-gray-100">
+                        <div className="flex items-center space-x-3 overflow-hidden">
+                          <div className="w-10 h-10 bg-white rounded-xl flex items-center justify-center shrink-0 border border-gray-100">
+                            {file.type.startsWith('image/') ? <ImageIcon className="w-5 h-5 text-emerald-500" /> : <FileIcon className="w-5 h-5 text-indigo-500" />}
+                          </div>
+                          <div className="flex flex-col overflow-hidden">
+                            <span className="text-sm font-bold text-gray-900 truncate">{file.name}</span>
+                            <span className="text-[10px] text-gray-400 uppercase font-bold tracking-wider">{formatFileSize(file.size)}</span>
+                          </div>
+                        </div>
+                        <a 
+                          href={file.data} 
+                          download={file.name}
+                          className="p-3 bg-white text-indigo-600 rounded-xl border border-gray-100 hover:bg-indigo-50 transition-all shadow-sm"
+                        >
+                          <Download className="w-5 h-5" />
+                        </a>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               {/* Homework Submission */}
               <div className="bg-white rounded-3xl border border-black/5 p-8 shadow-sm">
                 <div className="flex items-center space-x-3 mb-6">
@@ -1040,14 +1359,71 @@ export default function App() {
                   value={homeworkContent}
                   onChange={(e) => setHomeworkContent(e.target.value)}
                   placeholder="在此输入您的作业内容..."
-                  className="w-full h-48 px-5 py-4 bg-gray-50 border border-gray-100 rounded-2xl focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all resize-none mb-4"
+                  className="w-full h-32 px-5 py-4 bg-gray-50 border border-gray-100 rounded-2xl focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all resize-none mb-4"
                 />
+
+                {/* File Upload Area */}
+                <div 
+                  onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
+                  onDragLeave={() => setIsDragging(false)}
+                  onDrop={handleDrop}
+                  className={cn(
+                    "relative border-2 border-dashed rounded-2xl p-6 mb-4 transition-all flex flex-col items-center justify-center text-center cursor-pointer",
+                    isDragging ? "border-emerald-500 bg-emerald-50/50" : "border-gray-200 hover:border-emerald-400 hover:bg-gray-50/50"
+                  )}
+                  onClick={() => document.getElementById('file-upload')?.click()}
+                >
+                  <input 
+                    id="file-upload"
+                    type="file" 
+                    multiple 
+                    className="hidden" 
+                    onChange={handleFileSelect}
+                  />
+                  <div className="w-12 h-12 bg-emerald-50 rounded-full flex items-center justify-center mb-3">
+                    <Paperclip className="w-6 h-6 text-emerald-600" />
+                  </div>
+                  <p className="text-sm font-medium text-gray-700">点击或拖拽文件到此处</p>
+                  <p className="text-xs text-gray-400 mt-1">支持图片和各类文档</p>
+                </div>
+
+                {/* File List */}
+                {homeworkFiles.length > 0 && (
+                  <div className="space-y-2 mb-4">
+                    {homeworkFiles.map((file, idx) => (
+                      <div key={idx} className="flex items-center justify-between p-3 bg-gray-50 rounded-xl border border-gray-100">
+                        <div className="flex items-center space-x-3 overflow-hidden">
+                          {file.type.startsWith('image/') ? (
+                            <div className="w-8 h-8 rounded-lg overflow-hidden shrink-0">
+                              <img src={file.data} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                            </div>
+                          ) : (
+                            <div className="w-8 h-8 bg-indigo-50 rounded-lg flex items-center justify-center shrink-0">
+                              <FileIcon className="w-4 h-4 text-indigo-600" />
+                            </div>
+                          )}
+                          <div className="flex flex-col overflow-hidden">
+                            <span className="text-xs font-bold text-gray-900 truncate">{file.name}</span>
+                            <span className="text-[10px] text-gray-400">{formatFileSize(file.size)}</span>
+                          </div>
+                        </div>
+                        <button 
+                          onClick={(e) => { e.stopPropagation(); removeFile(idx); }}
+                          className="p-2 text-gray-400 hover:text-red-500 transition-colors"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
                 <button
                   onClick={submitHomework}
-                  disabled={!homeworkContent.trim()}
+                  disabled={!homeworkContent.trim() && homeworkFiles.length === 0}
                   className={cn(
                     "w-full py-4 rounded-2xl font-bold transition-all",
-                    !homeworkContent.trim()
+                    (!homeworkContent.trim() && homeworkFiles.length === 0)
                       ? "bg-gray-100 text-gray-400 cursor-not-allowed"
                       : "bg-emerald-600 text-white hover:bg-emerald-700 shadow-lg shadow-emerald-600/20"
                   )}
