@@ -1,0 +1,5 @@
+{
+  "name": "Student Computer Management System",
+  "description": "A central dashboard for managing student computers, organizing exams, and submitting homework.",
+  "requestFramePermissions": []
+}
