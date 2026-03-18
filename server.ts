@@ -9,6 +9,8 @@ const DATA_DIR = path.join(process.cwd(), "data");
 const CLASSES_FILE = path.join(DATA_DIR, "classes.json");
 const EXAMS_FILE = path.join(DATA_DIR, "exams.json");
 const RESULTS_FILE = path.join(DATA_DIR, "results.json");
+const SUBMISSIONS_FILE = path.join(DATA_DIR, "submissions.json");
+const DISTRIBUTED_FILES_FILE = path.join(DATA_DIR, "distributed_files.json");
 
 // Ensure data directory exists
 if (!fs.existsSync(DATA_DIR)) {
@@ -35,6 +37,14 @@ function saveExams(exams: any[]) {
 
 function saveResults(results: any[]) {
   fs.writeFileSync(RESULTS_FILE, JSON.stringify(results, null, 2));
+}
+
+function saveSubmissions(submissions: any[]) {
+  fs.writeFileSync(SUBMISSIONS_FILE, JSON.stringify(submissions, null, 2));
+}
+
+function saveDistributedFiles(files: any[]) {
+  fs.writeFileSync(DISTRIBUTED_FILES_FILE, JSON.stringify(files, null, 2));
 }
 
 async function startServer() {
@@ -65,6 +75,16 @@ async function startServer() {
     try {
       examResults = JSON.parse(fs.readFileSync(RESULTS_FILE, "utf-8"));
     } catch (e) { console.error("Error loading results:", e); }
+  }
+  if (fs.existsSync(SUBMISSIONS_FILE)) {
+    try {
+      submissions = JSON.parse(fs.readFileSync(SUBMISSIONS_FILE, "utf-8"));
+    } catch (e) { console.error("Error loading submissions:", e); }
+  }
+  if (fs.existsSync(DISTRIBUTED_FILES_FILE)) {
+    try {
+      distributedFiles = JSON.parse(fs.readFileSync(DISTRIBUTED_FILES_FILE, "utf-8"));
+    } catch (e) { console.error("Error loading distributed files:", e); }
   }
 
   // Socket.io logic
@@ -164,6 +184,7 @@ async function startServer() {
         timestamp: new Date() 
       };
       submissions.push(newSubmission);
+      saveSubmissions(submissions);
       io.emit("admin:submissions", submissions);
     });
 
@@ -190,6 +211,7 @@ async function startServer() {
         timestamp: new Date()
       };
       distributedFiles.push(newFile);
+      saveDistributedFiles(distributedFiles);
       io.emit("admin:distributed_files", distributedFiles);
       
       // Notify relevant students
@@ -213,7 +235,26 @@ async function startServer() {
 
     socket.on("admin:delete_distributed_file", (id) => {
       distributedFiles = distributedFiles.filter(f => f.id !== id);
+      saveDistributedFiles(distributedFiles);
       io.emit("admin:distributed_files", distributedFiles);
+    });
+
+    socket.on("admin:lock_student", (data) => {
+      // data: { studentId: string, locked: boolean }
+      activeStudents = activeStudents.map(s => s.id === data.studentId ? { ...s, locked: data.locked } : s);
+      io.emit("admin:students", activeStudents);
+      io.to(data.studentId).emit("student:lock_status", data.locked);
+    });
+
+    socket.on("admin:broadcast_message", (message) => {
+      io.emit("student:broadcast", message);
+    });
+
+    socket.on("admin:grade_submission", (data) => {
+      // data: { submissionId: string, grade: string, feedback: string }
+      submissions = submissions.map(s => s.id === data.submissionId ? { ...s, grade: data.grade, feedback: data.feedback } : s);
+      saveSubmissions(submissions);
+      io.emit("admin:submissions", submissions);
     });
 
     socket.on("disconnect", () => {
@@ -242,6 +283,26 @@ async function startServer() {
       res.sendFile(path.join(distPath, "index.html"));
     });
   }
+
+  // Auto-stop exams check
+  setInterval(() => {
+    let changed = false;
+    exams = exams.map(e => {
+      if (e.active && e.duration && e.startTime) {
+        const elapsed = (Date.now() - e.startTime) / 1000;
+        if (elapsed >= e.duration * 60) {
+          changed = true;
+          io.emit("student:exam_stopped", e.id);
+          return { ...e, active: false };
+        }
+      }
+      return e;
+    });
+    if (changed) {
+      saveExams(exams);
+      io.emit("admin:exams", exams);
+    }
+  }, 5000);
 
   httpServer.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT}`);

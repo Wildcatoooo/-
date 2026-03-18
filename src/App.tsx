@@ -22,7 +22,12 @@ import {
   File as FileIcon,
   Trash2,
   Download,
-  Clock
+  Clock,
+  Megaphone,
+  Lock,
+  Unlock,
+  Award,
+  X
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import mammoth from 'mammoth';
@@ -76,6 +81,8 @@ interface Submission {
   content: string;
   files?: SubmissionFile[];
   timestamp: Date;
+  grade?: string;
+  feedback?: string;
 }
 
 interface DistributedFile {
@@ -148,6 +155,7 @@ export default function App() {
   const [timeLeft, setTimeLeft] = useState<number | null>(null);
   const [studentAnswers, setStudentAnswers] = useState<number[]>([]);
   const studentAnswersRef = useRef<number[]>([]);
+  const [broadcastMessage, setBroadcastMessage] = useState<string | null>(null);
   useEffect(() => { studentAnswersRef.current = studentAnswers; }, [studentAnswers]);
 
   const [examSubmitted, setExamSubmitted] = useState(false);
@@ -225,7 +233,15 @@ export default function App() {
       newSocket.on('student:received_files', (data: DistributedFile[]) => setReceivedFiles(data));
       newSocket.on('student:new_file', (file: DistributedFile) => {
         setReceivedFiles(prev => [...prev, file]);
-        alert(`收到新文件: ${file.name}`);
+        // alert(`收到新文件: ${file.name}`); // Removed alert as per guidelines
+      });
+      newSocket.on('student:broadcast', (msg: string) => {
+        setBroadcastMessage(msg);
+        setTimeout(() => setBroadcastMessage(null), 10000);
+      });
+      newSocket.on('student:lock_status', (locked: boolean) => {
+        // This will trigger a re-render if we use it to update a local state or 
+        // if we rely on the broadcasted 'admin:students' data.
       });
       newSocket.on('student:exam_started', (exam: Exam) => {
         setActiveExam(exam);
@@ -725,6 +741,16 @@ export default function App() {
                   </div>
                 </div>
                 <div className="flex space-x-3">
+                  <button 
+                    onClick={() => {
+                      const msg = prompt("请输入要广播的消息：");
+                      if (msg) socketRef.current?.emit("admin:broadcast_message", msg);
+                    }}
+                    className="bg-amber-100 text-amber-700 px-4 py-2 rounded-xl font-bold flex items-center space-x-2 hover:bg-amber-200 transition-all text-sm"
+                  >
+                    <Megaphone className="w-4 h-4" />
+                    <span>全员广播</span>
+                  </button>
                   <div className="flex items-center bg-white border border-black/5 rounded-xl px-3 shadow-sm">
                     <Users className="w-4 h-4 text-gray-400 mr-2" />
                     <select 
@@ -832,6 +858,29 @@ export default function App() {
                                   {isOnline ? '在线' : '离线'}
                                 </span>
                               </div>
+
+                              {/* Lock Control */}
+                              {isOnline && (
+                                <button 
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    const studentId = students.find(s => s.name === name)?.id;
+                                    if (studentId) {
+                                      const isLocked = students.find(s => s.id === studentId)?.locked;
+                                      socketRef.current?.emit("admin:lock_student", { studentId, locked: !isLocked });
+                                    }
+                                  }}
+                                  className={cn(
+                                    "absolute bottom-2 right-2 p-1.5 rounded-lg transition-all",
+                                    students.find(s => s.name === name)?.locked 
+                                      ? "bg-red-100 text-red-600" 
+                                      : "bg-gray-100 text-gray-400 hover:text-indigo-600 hover:bg-indigo-50"
+                                  )}
+                                  title={students.find(s => s.name === name)?.locked ? "解锁屏幕" : "锁定屏幕"}
+                                >
+                                  {students.find(s => s.name === name)?.locked ? <Lock className="w-3 h-3" /> : <Unlock className="w-3 h-3" />}
+                                </button>
+                              )}
 
                               {/* Real-time Exam Progress */}
                               {isOnline && activeExam && (
@@ -1276,6 +1325,33 @@ export default function App() {
                               </div>
                               {sub.content && <p className="text-sm text-gray-600 leading-relaxed mb-3">{sub.content}</p>}
                               
+                              <div className="flex items-center justify-between mt-4 pt-4 border-t border-gray-100">
+                                <div className="flex items-center space-x-2">
+                                  <span className="text-[10px] font-bold text-gray-400 uppercase">评分:</span>
+                                  {sub.grade ? (
+                                    <span className="text-sm font-black text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded-lg">{sub.grade}</span>
+                                  ) : (
+                                    <span className="text-xs text-gray-400 italic">未评分</span>
+                                  )}
+                                </div>
+                                <button
+                                  onClick={() => {
+                                    const grade = prompt("请输入评分 (如: A, 95, 优秀):", sub.grade || "");
+                                    const feedback = prompt("请输入评语:", sub.feedback || "");
+                                    if (grade !== null) {
+                                      socketRef.current?.emit("admin:grade_submission", { 
+                                        submissionId: sub.id, 
+                                        grade, 
+                                        feedback 
+                                      });
+                                    }
+                                  }}
+                                  className="text-[10px] font-bold text-indigo-600 hover:bg-indigo-50 px-3 py-1.5 rounded-xl transition-all border border-indigo-100"
+                                >
+                                  {sub.grade ? '修改评分' : '立即评分'}
+                                </button>
+                              </div>
+
                               {sub.files && sub.files.length > 0 && (
                                 <div className="space-y-2">
                                   <p className="text-[10px] font-bold text-gray-400 uppercase tracking-wider">附件 ({sub.files.length})</p>
@@ -1610,6 +1686,30 @@ export default function App() {
     if (!isLoggedIn) {
       return (
         <div className="min-h-screen bg-[#F5F5F4] flex items-center justify-center p-4">
+          {/* Broadcast Message Toast */}
+          <AnimatePresence>
+            {broadcastMessage && (
+              <motion.div
+                initial={{ y: -100, opacity: 0 }}
+                animate={{ y: 20, opacity: 1 }}
+                exit={{ y: -100, opacity: 0 }}
+                className="fixed top-0 left-1/2 -translate-x-1/2 z-[10000] bg-amber-500 text-white px-8 py-4 rounded-2xl shadow-2xl flex items-center space-x-4 border border-amber-400"
+              >
+                <Megaphone className="w-6 h-6 animate-bounce" />
+                <div className="max-w-xs md:max-w-md text-left">
+                  <p className="text-[10px] font-black uppercase tracking-widest opacity-80">老师广播</p>
+                  <p className="font-bold text-lg leading-tight">{broadcastMessage}</p>
+                </div>
+                <button 
+                  onClick={() => setBroadcastMessage(null)}
+                  className="p-1 hover:bg-white/20 rounded-lg transition-colors"
+                >
+                  <XCircle className="w-5 h-5" />
+                </button>
+              </motion.div>
+            )}
+          </AnimatePresence>
+
           <motion.div 
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
@@ -1686,8 +1786,49 @@ export default function App() {
             </button>
           </div>
         )}
-        <div className="max-w-5xl mx-auto">
-          <header className="flex justify-between items-center mb-10">
+      <div className="max-w-5xl mx-auto">
+        {/* Student Lock Overlay */}
+        {students.find(s => s.name === studentName)?.locked && (
+          <div className="fixed inset-0 z-[9999] bg-black/90 flex flex-col items-center justify-center text-white p-10 text-center">
+            <motion.div
+              initial={{ scale: 0.8, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              className="flex flex-col items-center"
+            >
+              <div className="w-24 h-24 bg-red-500/20 rounded-full flex items-center justify-center mb-8 border border-red-500/50">
+                <Lock className="w-12 h-12 text-red-500 animate-pulse" />
+              </div>
+              <h1 className="text-4xl font-black mb-4 tracking-tight">屏幕已锁定</h1>
+              <p className="text-xl text-gray-400 max-w-md">老师已暂时锁定您的屏幕，请注意听讲或等待老师解锁。</p>
+            </motion.div>
+          </div>
+        )}
+
+        {/* Broadcast Message Toast */}
+        <AnimatePresence>
+          {broadcastMessage && (
+            <motion.div
+              initial={{ y: -100, opacity: 0 }}
+              animate={{ y: 20, opacity: 1 }}
+              exit={{ y: -100, opacity: 0 }}
+              className="fixed top-0 left-1/2 -translate-x-1/2 z-[10000] bg-amber-500 text-white px-8 py-4 rounded-2xl shadow-2xl flex items-center space-x-4 border border-amber-400"
+            >
+              <Megaphone className="w-6 h-6 animate-bounce" />
+              <div className="max-w-xs md:max-w-md text-left">
+                <p className="text-[10px] font-black uppercase tracking-widest opacity-80">老师广播</p>
+                <p className="font-bold text-lg leading-tight">{broadcastMessage}</p>
+              </div>
+              <button 
+                onClick={() => setBroadcastMessage(null)}
+                className="p-1 hover:bg-white/20 rounded-lg transition-colors"
+              >
+                <XCircle className="w-5 h-5" />
+              </button>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        <header className="flex justify-between items-center mb-10">
             <div className="flex items-center space-x-4">
               <div className="w-12 h-12 bg-emerald-600 rounded-2xl flex items-center justify-center shadow-lg shadow-emerald-600/20">
                 <Users className="w-6 h-6 text-white" />
@@ -1984,6 +2125,71 @@ export default function App() {
                   <div className="flex justify-between items-center text-sm">
                     <span className="text-gray-400">当前时间</span>
                     <span className="font-mono">{new Date().toLocaleTimeString()}</span>
+                  </div>
+                </div>
+              </div>
+
+              {/* My Submissions & Grades */}
+              <div className="bg-white rounded-3xl border border-black/5 p-8 shadow-sm">
+                <div className="flex items-center space-x-3 mb-6">
+                  <div className="w-10 h-10 bg-amber-50 rounded-xl flex items-center justify-center">
+                    <Award className="w-5 h-5 text-amber-600" />
+                  </div>
+                  <h2 className="text-xl font-bold text-gray-900">我的成绩与反馈</h2>
+                </div>
+                <div className="space-y-4">
+                  {/* Homework Submissions */}
+                  <div className="space-y-3">
+                    <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">作业反馈</p>
+                    {submissions.filter(s => s.studentName === studentName).length === 0 ? (
+                      <p className="text-xs text-gray-400 italic">暂无作业提交记录</p>
+                    ) : (
+                      submissions
+                        .filter(s => s.studentName === studentName)
+                        .slice().reverse()
+                        .map(sub => (
+                          <div key={sub.id} className="p-4 bg-gray-50 rounded-2xl border border-gray-100 space-y-2">
+                            <div className="flex justify-between items-start">
+                              <span className="text-xs font-bold text-gray-900">{new Date(sub.timestamp).toLocaleString()}</span>
+                              {sub.grade && (
+                                <span className="text-xs font-black text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded-lg">评分: {sub.grade}</span>
+                              )}
+                            </div>
+                            {sub.feedback && (
+                              <div className="p-3 bg-white rounded-xl border border-gray-100">
+                                <p className="text-[10px] font-bold text-gray-400 uppercase mb-1">老师评语:</p>
+                                <p className="text-xs text-gray-700 leading-relaxed">{sub.feedback}</p>
+                              </div>
+                            )}
+                          </div>
+                        ))
+                    )}
+                  </div>
+
+                  {/* Exam Results */}
+                  <div className="space-y-3 pt-4 border-t border-gray-100">
+                    <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">考试成绩</p>
+                    {examResults.filter(r => r.studentName === studentName).length === 0 ? (
+                      <p className="text-xs text-gray-400 italic">暂无考试记录</p>
+                    ) : (
+                      examResults
+                        .filter(r => r.studentName === studentName)
+                        .slice().reverse()
+                        .map(res => {
+                          const exam = exams.find(e => e.id === res.examId);
+                          return (
+                            <div key={res.id} className="p-4 bg-gray-50 rounded-2xl border border-gray-100 flex justify-between items-center">
+                              <div>
+                                <p className="text-sm font-bold text-gray-900">{exam?.title || '未知考试'}</p>
+                                <p className="text-[10px] text-gray-400">{new Date(res.timestamp).toLocaleString()}</p>
+                              </div>
+                              <div className="text-right">
+                                <p className="text-lg font-black text-emerald-600">{res.score} <span className="text-[10px] text-gray-400 font-normal">分</span></p>
+                              </div>
+                            </div>
+                          );
+                        })
+                    )}
                   </div>
                 </div>
               </div>
